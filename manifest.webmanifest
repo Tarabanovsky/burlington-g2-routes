@@ -1,0 +1,16 @@
+{
+  "name": "Burlington G2 practice routes",
+  "short_name": "G2 Routes",
+  "description": "Unofficial practice routes for the G2 road test at DriveTest Burlington, with live checkpoints.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1d3f6e",
+  "theme_color": "#1d3f6e",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

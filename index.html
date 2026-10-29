@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Burlington G2 practice routes</title>
+<meta name="description" content="Unofficial practice routes for the G2 road test at DriveTest Burlington, with live turn-by-turn checkpoints.">
+<meta name="theme-color" content="#1d3f6e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="G2 Routes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="bar">
+  <nav class="tabs" id="tabs" aria-label="Routes"></nav>
+  <div class="bar-actions">
+    <div class="seg" role="group" aria-label="Mode">
+      <button type="button" data-mode="live" title="Live GPS: follows you as you drive"><span class="long">Live </span>GPS</button>
+      <button type="button" data-mode="tap" title="Tap through the checkpoints"><span>Tap</span><span class="long"> through</span></button>
+    </div>
+    <button type="button" class="icon-btn" id="voice" aria-pressed="false" title="Read instructions aloud">Voice</button>
+    <button type="button" class="icon-btn" id="about-btn" title="About, sources, safety"><span class="long">About</span><span class="short">?</span></button>
+  </div>
+</header>
+
+<main class="split">
+  <section class="map-pane">
+    <div id="map" aria-label="Route map"></div>
+    <button type="button" class="recenter" id="recenter" hidden>Recenter</button>
+  </section>
+
+  <section class="panel" id="panel">
+    <div class="progress" id="progress" title="Progress">
+      <div class="fill" id="progress-fill"></div>
+      <span id="progress-text"></span>
+    </div>
+    <div class="status" id="status" hidden></div>
+    <article class="now" id="now"></article>
+    <div class="nav" id="nav">
+      <button type="button" id="back">Back</button>
+      <button type="button" id="next" class="primary">Next</button>
+    </div>
+    <div class="then" id="then"></div>
+    <details class="all" id="all">
+      <summary id="all-summary">All checkpoints</summary>
+      <ol class="list" id="list"></ol>
+    </details>
+  </section>
+</main>
+
+<dialog id="about">
+  <form method="dialog" class="about">
+    <h2>Burlington G2 practice routes</h2>
+    <p class="warn"><b>Unofficial.</b> DriveTest doesn't publish routes, and examiners vary them. These are routes
+      test-takers reported (turn-by-turn from 2018; the same areas are still named in 2022–2026 reports),
+      snapped onto OpenStreetMap. Use them to learn the area, not to memorise one line.</p>
+    <p class="warn"><b>Set it up before you drive and mount the phone.</b> In Ontario a driver may not hold or
+      touch a phone while driving, even stopped at a red light. For a G1 or G2 driver, a first conviction
+      means a 30-day suspension. Live GPS mode needs no taps; let the supervising driver handle anything else.
+      <a id="law-link" target="_blank" rel="noopener">ontario.ca</a></p>
+    <div id="about-route"></div>
+    <h3>How to</h3>
+    <ul>
+      <li><b>Phone:</b> choose a route, tap <i>Start drive</i>, and drive. Checkpoints advance on their own. If it
+        gets confused, the passenger can tap a checkpoint under <i>All checkpoints</i> to re-sync.</li>
+      <li><b>Laptop:</b> <i>Tap through</i> mode. Use Next and Back, tap any checkpoint, or click the progress bar.</li>
+      <li><b>Install:</b> Safari → Share → <i>Add to Home Screen</i> (Android Chrome: menu → <i>Install app</i>).</li>
+    </ul>
+    <div class="about-actions">
+      <button type="button" id="sim-btn">Simulate a drive (demo)</button>
+      <button type="button" id="reset-btn">Reset progress for this route</button>
+    </div>
+    <h3>Sources</h3>
+    <ol class="sources" id="sources"></ol>
+    <p class="small" id="built"></p>
+    <p class="small">Something wrong on the map (a missing stop sign, a wrong speed limit)?
+      <a href="https://www.openstreetmap.org/fixthemap" target="_blank" rel="noopener">Report it to OpenStreetMap</a>.</p>
+    <div class="about-actions"><button value="close" class="primary">Close</button></div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

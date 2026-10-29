@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#1d3f6e"/>
+  <path d="M96 420 C 150 300, 250 360, 290 250 S 380 120, 430 96" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round"/>
+  <path d="M96 420 C 150 300, 250 360, 290 250 S 380 120, 430 96" fill="none" stroke="#1d3f6e" stroke-width="6" stroke-dasharray="26 22" stroke-linecap="round"/>
+  <circle cx="96" cy="420" r="30" fill="#f08c00" stroke="#ffffff" stroke-width="10"/>
+  <circle cx="430" cy="96" r="30" fill="#2f9e44" stroke="#ffffff" stroke-width="10"/>
+  <text x="118" y="210" font-family="Helvetica, Arial, sans-serif" font-size="150" font-weight="700" fill="#ffffff">G2</text>
+</svg>
