@@ -14,12 +14,19 @@
   };
 
   const PASS_M = 12;            // a checkpoint counts as passed once progress is this close to it
-  const LOOKAHEAD_M = 300;      // how far ahead of current progress a fix may match
+  const MIN_AHEAD_M = 80;       // a fix may match at least this far ahead of current progress…
+  const MAX_PLAUSIBLE_MPS = 35; // …or as far as the car could have driven since the last good fix
+  const REWIND_M = 150;         // wider search reaches this far back, to undo a wrong jump
   const ON_ROUTE_M = 40;
-  const OFF_ROUTE_FIXES = 4;
+  const OFF_ROUTE_FIXES = 3;    // consecutive misses before telling the driver they're off route
   const MAX_SPEED_MPS = 45;     // faster jumps between fixes are GPS glitches
   const WEAK_ACCURACY_M = 75;
-  const WRONG_WAY_PENALTY_M = 40;
+  const TIE_M = 12;             // candidates this close to the best are ties; heading breaks them
+  const MOVING_MPS = 2.5;       // below this, GPS heading is noise (stopped, reversing, parking)
+  const HEADING_TTL_MS = 30000;
+  const STALE_MS = 12000;       // no fix for this long: tell the driver GPS has paused
+  const RESTART_WATCH_MS = 15000;
+  const LOG_MAX = 3000;
   const SAY_FAR_M = 160;
   const SAY_NEAR_M = 90;
   const RESUME_MS = 10 * 60 * 1000;
@@ -30,9 +37,11 @@
     routeId: store.get('route', D.routes[0].id),
     mode: store.get('mode', touch && 'geolocation' in navigator ? 'live' : 'tap'),
     voice: store.get('voice', false),
-    idx: 0, s: 0, locked: false, off: 0, last: null, headFrom: null, heading: null,
+    idx: 0, s: 0, locked: false, off: 0, last: null, heading: null, headingAt: 0,
+    v: 0, lastGood: null, hist: [],
     follow: true, running: false, watchId: null, simTimer: null, wake: null,
     spoken: {}, shownIdx: -1, fix: null, finishedSaid: false,
+    lastFixAt: 0, watchStartedAt: 0, log: [],
   };
   if (!D.routes.some((r) => r.id === S.routeId)) S.routeId = D.routes[0].id;
   let R = null;
@@ -47,7 +56,10 @@
   D.routes.forEach((r) => { r.xy = r.pts.map((p) => toXY(p[0], p[1])); r.len = r.cum[r.cum.length - 1]; });
 
   // ---------- Geometry ----------
-  function project(r, x, y, sMin, sMax, heading) {
+  // Nearest point on the route between sMin and sMax. Where the route passes the same spot twice
+  // (out-and-back streets, shared roads), near-ties are split by direction of travel, then by
+  // closeness to where the car should be by now. Heading never decides whether a fix is on the route.
+  function project(r, x, y, sMin, sMax, heading, expected) {
     const cands = [];
     for (let i = 0; i < r.xy.length - 1; i++) {
       if (r.cum[i + 1] < sMin || r.cum[i] > sMax) continue;
@@ -58,18 +70,21 @@
       const l2 = dx * dx + dy * dy;
       let t = l2 ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0;
       t = Math.max(0, Math.min(1, t));
-      const s = r.cum[i] + t * (r.cum[i + 1] - r.cum[i]);
-      if (s < sMin || s > sMax) continue;
-      let d = Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+      const s = Math.max(sMin, Math.min(sMax, r.cum[i] + t * (r.cum[i + 1] - r.cum[i])));
+      const d = Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+      let wrongWay = false;
       if (heading != null && l2 > 4) {
         const seg = (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
-        if (Math.abs(((heading - seg + 540) % 360) - 180) > 100) d += WRONG_WAY_PENALTY_M;
+        wrongWay = Math.abs(((heading - seg + 540) % 360) - 180) > 100;
       }
-      cands.push({ s, d });
+      cands.push({ s, d, wrongWay });
     }
     if (!cands.length) return null;
     const dmin = Math.min(...cands.map((c) => c.d));
-    return cands.filter((c) => c.d <= dmin + 8).sort((a, b) => a.s - b.s)[0];
+    let ties = cands.filter((c) => c.d <= dmin + TIE_M);
+    if (ties.some((c) => !c.wrongWay)) ties = ties.filter((c) => !c.wrongWay);
+    const rank = expected == null ? (c) => c.s : (c) => Math.abs(c.s - expected);
+    return ties.sort((a, b) => rank(a) - rank(b))[0];
   }
 
   function pointAt(r, s) {
@@ -342,12 +357,53 @@
     S.s = i > 0 ? Math.max(0, cps[i - 1].at - PASS_M + 1) : 0;
     S.locked = true;
     S.off = 0;
+    S.lastGood = { t: (S.fix ? S.fix.t : Date.now()) - 30000, s: S.s };  // let the next fix jump ahead
+    log({ ev: 'resync', to: i, s: Math.round(S.s) });
     delete S.spoken[R.id + ':' + i];
     toast(`Re-synced to checkpoint ${i + 1}`);
     renderCard();
   }
 
+  // ---------- Drive log (stays on the phone unless exported from About) ----------
+  function log(entry) {
+    S.log.push({ at: Date.now(), ...entry });
+    if (S.log.length > LOG_MAX) S.log.splice(0, S.log.length - LOG_MAX);
+    if (S.log.length % 15 === 0) saveLog();
+  }
+  function saveLog() { store.set('log', S.log); }
+
+  function exportLog() {
+    saveLog();
+    const body = JSON.stringify({ app: 'burlington-g2-routes', built: D.built, route: R.id, entries: S.log });
+    const name = `g2-drive-log-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.json`;
+    const blob = new Blob([body], { type: 'application/json' });
+    try {
+      const file = new File([blob], name, { type: 'application/json' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        navigator.share({ files: [file], title: 'G2 drive log' }).catch(() => {});
+        return;
+      }
+    } catch (e) { /* no File constructor: fall back to download */ }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+
   // ---------- Live mode ----------
+  function startWatch() {
+    if (S.watchId != null) navigator.geolocation.clearWatch(S.watchId);
+    S.watchStartedAt = Date.now();
+    S.watchId = navigator.geolocation.watchPosition(
+      (p) => onFix({
+        lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, t: p.timestamp,
+        spd: p.coords.speed, hdg: p.coords.heading,
+      }),
+      onGeoError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+  }
+
   function startDrive(useGps) {
     const gps = useGps !== false;
     if (gps && !('geolocation' in navigator)) { toast('This browser has no location access'); return; }
@@ -366,17 +422,19 @@
     }
     S.off = 0;
     S.last = null;
-    S.headFrom = null;
     S.heading = null;
+    S.headingAt = 0;
+    S.v = 0;
+    S.lastGood = S.locked ? { t: saved.t, s: S.s } : null;
+    S.hist = [];
     S.spoken = {};
     S.finishedSaid = false;
+    S.lastFixAt = Date.now();
+    S.log = [];
+    log({ ev: 'start', route: R.id, gps, resumed: S.locked, s: Math.round(S.s), ua: navigator.userAgent });
     primeSpeech();
     keepAwake();
-    if (gps) {
-      S.watchId = navigator.geolocation.watchPosition(
-        (p) => onFix({ lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, t: p.timestamp }),
-        onGeoError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
-    }
+    if (gps) startWatch();
     status(gps ? 'Waiting for GPS…' : 'Demo drive');
     renderCard();
   }
@@ -387,67 +445,161 @@
     stopSim();
     S.running = false;
     releaseWake();
+    log({ ev: 'stop', s: Math.round(S.s) });
+    saveLog();
     status(null);
     renderCard();
   }
 
   function onGeoError(err) {
+    log({ ev: 'geo-error', code: err.code, msg: err.message });
     const msg = err.code === 1 ? 'Location permission denied. Allow location for this site in your browser settings.'
       : err.code === 3 ? 'Still waiting for GPS… (go outside or near a window)' : 'Location unavailable right now.';
     status(msg, 'bad');
   }
 
+  // Direction of travel, only while really moving. Stopped, crawling or reversing, GPS "heading"
+  // is jitter; the last good heading is kept for HEADING_TTL_MS (the car still faces that way).
+  const bearingOf = (ax, ay, bx, by) => (Math.atan2(bx - ax, by - ay) * 180 / Math.PI + 360) % 360;
+  const angleDiff = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
+
+  function updateHeading(f, x, y) {
+    const now = f.t;
+    const speedKnown = Number.isFinite(f.spd) && f.spd >= 0;
+    if (speedKnown && f.spd >= MOVING_MPS && Number.isFinite(f.hdg) && f.hdg >= 0) {
+      S.heading = f.hdg;
+      S.headingAt = now;
+    } else if (!speedKnown || f.spd >= MOVING_MPS) {
+      // No usable device heading: trust movement only if 2–8 s of fixes agree on a direction.
+      const old = S.hist.find((h) => f.t - h.t >= 2000 && f.t - h.t <= 8000);
+      if (old) {
+        const mid = S.hist.find((h) => h.t > old.t && f.t - h.t >= 1000) || old;
+        const dd = Math.hypot(x - old.x, y - old.y);
+        const dt = (f.t - old.t) / 1000;
+        const b1 = bearingOf(old.x, old.y, mid.x, mid.y);
+        const b2 = bearingOf(mid.x, mid.y, x, y);
+        const steady = mid === old || (Math.hypot(mid.x - old.x, mid.y - old.y) >= 6
+          && Math.hypot(x - mid.x, y - mid.y) >= 6 && angleDiff(b1, b2) <= 45);
+        if (dd >= 15 && dd / dt >= MOVING_MPS && steady) {
+          S.heading = bearingOf(old.x, old.y, x, y);
+          S.headingAt = now;
+        }
+      }
+    }
+    S.hist.push({ x, y, t: f.t });
+    while (S.hist.length && f.t - S.hist[0].t > 10000) S.hist.shift();
+    if (now - S.headingAt > HEADING_TTL_MS) S.heading = null;
+  }
+
+  // Where along the route is this fix? First near the current progress (forward only), then from a
+  // little behind, so a GPS gap or a wrong jump recovers at once. Never further ahead than the car
+  // could have driven since the last good fix; ties go to the pass nearest where the car should be.
+  function locate(x, y, f) {
+    const tol = Math.max(ON_ROUTE_M, f.acc + 15);
+    const dt = S.lastGood ? Math.max(1, (f.t - S.lastGood.t) / 1000) : 1;
+    const ahead = Math.max(MIN_AHEAD_M, MAX_PLAUSIBLE_MPS * dt + f.acc);
+    const expected = S.s + Math.min(S.v * dt, ahead);
+    const back = Math.max(f.acc, 25);
+    const near = project(R, x, y, S.s - back, S.s + ahead, S.heading, expected);
+    if (near && near.d <= tol && !near.wrongWay) return { s: Math.max(S.s, near.s), how: 'near', d: near.d };
+    // Rewinding is only safe on a fresh direction of travel; a stale one points back down the
+    // street the car just left (right after a turnaround).
+    const fresh = S.heading != null && f.t - S.headingAt < 5000;
+    const wide = project(R, x, y, Math.max(0, S.s - (fresh ? REWIND_M : back)), S.s + ahead, S.heading, expected);
+    if (wide && wide.d <= tol && !wide.wrongWay) return { s: wide.s, how: wide.s < S.s ? 'rewind' : 'jump', d: wide.d };
+    // On the line but only against our direction of travel: hold progress, and don't count it as a
+    // good fix, so the search window keeps widening until the right pass is in reach.
+    if (near && near.d <= tol) return { s: S.s, how: 'hold', d: near.d };
+    return { s: S.s, how: 'off', d: near ? near.d : wide ? wide.d : null };
+  }
+
+  function noteGood(f, newS) {
+    if (S.lastGood) {
+      const dt = (f.t - S.lastGood.t) / 1000;
+      const inst = Number.isFinite(f.spd) && f.spd >= 0 ? f.spd : dt > 0 ? Math.max(0, newS - S.lastGood.s) / dt : S.v;
+      S.v = Math.min(MAX_PLAUSIBLE_MPS, 0.5 * S.v + 0.5 * inst);
+    }
+    S.lastGood = { t: f.t, s: newS };
+  }
+
   function onFix(f) {
     S.fix = f;
+    S.lastFixAt = Date.now();
     meDot.setLatLng([f.lat, f.lon]).addTo(map);
     meAcc.setLatLng([f.lat, f.lon]).setRadius(f.acc).addTo(map);
     if (S.follow) map.setView([f.lat, f.lon], Math.max(map.getZoom(), 16), { animate: true });
     const [x, y] = toXY(f.lat, f.lon);
-    if (f.acc > WEAK_ACCURACY_M) { status(`Weak GPS signal (±${Math.round(f.acc)} m)`, 'bad'); return; }
+    const entry = {
+      t: f.t, lat: +f.lat.toFixed(6), lon: +f.lon.toFixed(6), acc: Math.round(f.acc),
+      spd: Number.isFinite(f.spd) ? +f.spd.toFixed(1) : null, hdg: Number.isFinite(f.hdg) ? Math.round(f.hdg) : null,
+    };
+    if (f.acc > WEAK_ACCURACY_M) {
+      status(`Weak GPS signal (±${Math.round(f.acc)} m)`, 'bad');
+      log({ ...entry, how: 'weak' });
+      return;
+    }
     if (S.last) {
       const dt = (f.t - S.last.t) / 1000;
-      if (dt > 0 && Math.hypot(x - S.last.x, y - S.last.y) / dt > MAX_SPEED_MPS) return;
+      if (dt > 0 && Math.hypot(x - S.last.x, y - S.last.y) / dt > MAX_SPEED_MPS) {
+        log({ ...entry, how: 'glitch' });
+        return;
+      }
     }
+    updateHeading(f, x, y);
     S.last = { x, y, t: f.t };
-    if (!S.headFrom) S.headFrom = { x, y };
-    else if (Math.hypot(x - S.headFrom.x, y - S.headFrom.y) > 6) {
-      S.heading = (Math.atan2(x - S.headFrom.x, y - S.headFrom.y) * 180 / Math.PI + 360) % 360;
-      S.headFrom = { x, y };
-    }
 
+    let how;
+    let d = null;
     if (!S.locked) {
       const p = project(R, x, y, 0, R.len, S.heading);
+      d = p ? p.d : null;
       if (p && p.d <= ON_ROUTE_M) {
         S.locked = true;
         S.s = p.s;
+        noteGood(f, p.s);
+        how = 'lock';
       } else {
         const toStart = Math.hypot(x - R.xy[0][0], y - R.xy[0][1]);
         status(`Not on the route yet. The start (DriveTest plaza) is ${fmtDist(toStart)} away.`);
+        log({ ...entry, how: 'unlocked', d: d == null ? null : Math.round(d) });
         updateLive();
         return;
       }
     } else {
-      const p = project(R, x, y, S.s - Math.max(f.acc, 25), S.s + LOOKAHEAD_M, S.heading);
-      if (p && p.d <= Math.max(ON_ROUTE_M, f.acc + 15)) {
-        S.off = 0;
-        if (p.s > S.s) S.s = p.s;
-      } else if (++S.off >= OFF_ROUTE_FIXES) {
-        const q = project(R, x, y, Math.max(0, S.s - 150), R.len, S.heading);
-        if (q && q.d <= 30) {
-          S.s = q.s;
-          S.off = 0;
-        } else {
+      const m = locate(x, y, f);
+      how = m.how;
+      d = m.d;
+      if (how === 'off') {
+        S.off += 1;
+        if (S.off >= OFF_ROUTE_FIXES) {
           const c = R.checkpoints[currentIndex()];
           status(`Off the route. Head back toward ${c.street || 'the line on the map'}.`, 'bad');
-          updateLive();
-          return;
         }
+      } else {
+        S.off = 0;
+        S.s = m.s;
+        if (how !== 'hold') noteGood(f, m.s);
       }
     }
-    status(`On route · GPS ±${Math.round(f.acc)} m`, 'good');
-    store.set('live:' + R.id, { s: S.s, t: Date.now() });
+    log({ ...entry, how, s: Math.round(S.s), d: d == null ? null : Math.round(d),
+      hd: S.heading == null ? null : Math.round(S.heading), idx: currentIndex() });
+    if (how !== 'off') {
+      status(`On route · GPS ±${Math.round(f.acc)} m`, 'good');
+      store.set('live:' + R.id, { s: S.s, t: Date.now() });
+    }
     updateLive();
   }
+
+  setInterval(() => {
+    if (!S.running || S.simTimer || S.watchId == null || document.visibilityState !== 'visible') return;
+    const age = Date.now() - S.lastFixAt;
+    if (age < STALE_MS) return;
+    status(`Waiting for GPS: no update for ${Math.round(age / 1000)} s. Keep this app open with the screen on.`, 'bad');
+    if (Date.now() - S.watchStartedAt > RESTART_WATCH_MS) {
+      log({ ev: 'watch-restart', age });
+      startWatch();
+    }
+  }, 2000);
 
   function updateLive() {
     const i = currentIndex();
@@ -477,12 +629,18 @@
   }
 
   // ---------- Voice, wake lock ----------
+  let utterance = null;   // keep a reference: some engines drop utterances that get garbage-collected
   function speak(text) {
     if (!S.voice || !('speechSynthesis' in window)) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'en-CA';
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(u);
+    const ss = window.speechSynthesis;
+    const go = () => {
+      utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en-CA';
+      ss.resume();
+      ss.speak(utterance);
+    };
+    if (ss.speaking || ss.pending) { ss.cancel(); setTimeout(go, 80); } else go();
+    if (S.running) log({ ev: 'say', text });
   }
   function primeSpeech() {
     if (!S.voice || !('speechSynthesis' in window)) return;
@@ -490,15 +648,43 @@
     u.volume = 0;
     window.speechSynthesis.speak(u);
   }
+  let wakeRetryAt = 0;
   async function keepAwake() {
-    try { if ('wakeLock' in navigator) S.wake = await navigator.wakeLock.request('screen'); } catch (e) { /* not granted */ }
+    if (!('wakeLock' in navigator)) {
+      log({ ev: 'wakelock', ok: false, err: 'unsupported' });
+      toast('This browser may let the screen lock. Set Auto-Lock to Never while you practise.');
+      return;
+    }
+    try {
+      S.wake = await navigator.wakeLock.request('screen');
+      log({ ev: 'wakelock', ok: true });
+      S.wake.addEventListener('release', () => {
+        log({ ev: 'wakelock-released' });
+        if (S.running && document.visibilityState === 'visible' && Date.now() > wakeRetryAt) {
+          wakeRetryAt = Date.now() + 10000;
+          setTimeout(keepAwake, 1000);
+        }
+      });
+    } catch (e) {
+      log({ ev: 'wakelock', ok: false, err: e.name });
+      toast("Couldn't keep the screen on. Set Auto-Lock to Never while you practise.");
+    }
   }
   function releaseWake() {
-    if (S.wake) S.wake.release().catch(() => {});
+    const w = S.wake;
     S.wake = null;
+    if (w) w.release().catch(() => {});
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && S.running) keepAwake();
+    if (!S.running) return;
+    log({ ev: document.visibilityState });
+    if (document.visibilityState === 'hidden') { saveLog(); return; }
+    keepAwake();
+    if (S.watchId != null) {
+      S.lastFixAt = Date.now();
+      startWatch();
+      toast('Back on: finding your position…');
+    }
   });
 
   // ---------- Demo drive ----------
@@ -515,8 +701,10 @@
       t += 1000;
       if (s > R.len) { stopSim(); return; }
       const [x, y] = pointAt(R, s);
+      const [bx, by] = pointAt(R, Math.min(R.len, s + 5));
+      const [ax, ay] = pointAt(R, Math.max(0, s - 5));
       const [lat, lon] = fromXY(x + (Math.random() - 0.5) * 8, y + (Math.random() - 0.5) * 8);
-      onFix({ lat, lon, acc: 8, t });
+      onFix({ lat, lon, acc: 8, t, spd: 12, hdg: bearingOf(ax, ay, bx, by) });
     }, 250);
     toast('Demo: simulated drive at 4× speed');
   }
@@ -589,6 +777,7 @@
   }
   $('#about-btn').onclick = () => { fillAbout(); $('#about').showModal(); };
   $('#sim-btn').onclick = startSim;
+  $('#log-btn').onclick = exportLog;
   $('#reset-btn').onclick = () => {
     store.set('live:' + R.id, null);
     store.set('tap:' + R.id, 0);
@@ -601,6 +790,7 @@
     toast('Progress reset');
   };
 
+  S.log = store.get('log', []);
   setRoute(S.routeId);
   if (S.mode === 'tap') focusCheckpoint(S.idx);
 
